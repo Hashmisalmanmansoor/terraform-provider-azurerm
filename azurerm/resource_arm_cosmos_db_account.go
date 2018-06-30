@@ -71,6 +71,10 @@ func resourceArmCosmosDBAccount() *schema.Resource {
 			"ip_range_filter": {
 				Type:     schema.TypeString,
 				Optional: true,
+				ValidateFunc: validation.StringMatch(
+					regexp.MustCompile(`^(\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\/[1-2][0-9])?\b[,]?){1,}$`),
+					"Cosmos DB ip_range_filter must be a set of CIDR IP addresses separated by commas with no spaces: '10.0.0.1,10.0.0.2,10.20.0.0/16'",
+				),
 			},
 
 			"enable_automatic_failover": {
@@ -209,23 +213,36 @@ func resourceArmCosmosDBAccount() *schema.Resource {
 			},
 
 			"primary_master_key": {
-				Type:     schema.TypeString,
-				Computed: true,
+				Type:      schema.TypeString,
+				Computed:  true,
+				Sensitive: true,
 			},
 
 			"secondary_master_key": {
-				Type:     schema.TypeString,
-				Computed: true,
+				Type:      schema.TypeString,
+				Computed:  true,
+				Sensitive: true,
 			},
 
 			"primary_readonly_master_key": {
-				Type:     schema.TypeString,
-				Computed: true,
+				Type:      schema.TypeString,
+				Computed:  true,
+				Sensitive: true,
 			},
 
 			"secondary_readonly_master_key": {
-				Type:     schema.TypeString,
-				Computed: true,
+				Type:      schema.TypeString,
+				Computed:  true,
+				Sensitive: true,
+			},
+
+			"connection_strings": {
+				Type:      schema.TypeList,
+				Computed:  true,
+				Sensitive: true,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
 			},
 		},
 	}
@@ -245,9 +262,16 @@ func resourceArmCosmosDBAccountCreate(d *schema.ResourceData, meta interface{}) 
 	ipRangeFilter := d.Get("ip_range_filter").(string)
 	enableAutomaticFailover := d.Get("enable_automatic_failover").(bool)
 
+	r, err := client.CheckNameExists(ctx, name)
+	if err != nil {
+		return fmt.Errorf("Error checking if CosmosDB Account %q already exists (Resource Group %q): %+v", name, resourceGroup, err)
+	}
+	if !utils.ResponseWasNotFound(r) {
+		return fmt.Errorf("CosmosDB Account %s already exists, please import the resource via terraform import", name)
+	}
+
 	//hacky, todo fix up once deprecated field 'failover_policy' is removed
 	var geoLocations []documentdb.Location
-	var err error
 	if _, ok := d.GetOk("geo_location"); ok {
 		geoLocations, err = expandAzureRmCosmosDBAccountGeoLocations(name, d)
 		if err != nil {
@@ -260,7 +284,7 @@ func resourceArmCosmosDBAccountCreate(d *schema.ResourceData, meta interface{}) 
 		}
 	} else {
 		//could be a CustomizeDiff?, but this is temporary
-		return fmt.Errorf("Neither `geo_location` or `failover_policy` is set for CosmosDB Account '%s'", name)
+		return fmt.Errorf("Neither `geo_location` or `failover_policy` is set for CosmosDB Account %s", name)
 	}
 
 	account := documentdb.DatabaseAccountCreateUpdateParameters{
@@ -281,9 +305,7 @@ func resourceArmCosmosDBAccountCreate(d *schema.ResourceData, meta interface{}) 
 		return fmt.Errorf("Error creating CosmosDB Account %q (Resource Group %q): %+v", name, resourceGroup, err)
 	}
 
-	//todo is this still required?
-	r := *resp
-	id := r.ID
+	id := resp.ID
 	if id == nil {
 		return fmt.Errorf("Cannot read CosmosDB Account '%s' (resource group %s) ID", name, resourceGroup)
 	}
@@ -488,21 +510,35 @@ func resourceArmCosmosDBAccountRead(d *schema.ResourceData, meta interface{}) er
 		d.Set("write_endpoints", writeEndpoints)
 	}
 
+	// ListKeys returns a data structure containing a DatabaseAccountListReadOnlyKeysResult pointer
+	// implying that it also returns the read only keys, however this appears to not be the case
 	keys, err := client.ListKeys(ctx, resourceGroup, name)
 	if err != nil {
-		log.Printf("[ERROR] Unable to List Write keys for CosmosDB Account %s: %s", name, err)
-	} else {
-		d.Set("primary_master_key", keys.PrimaryMasterKey)
-		d.Set("secondary_master_key", keys.SecondaryMasterKey)
+		return fmt.Errorf("[ERROR] Unable to List Write keys for CosmosDB Account %s: %s", name, err)
 	}
+	d.Set("primary_master_key", keys.PrimaryMasterKey)
+	d.Set("secondary_master_key", keys.SecondaryMasterKey)
 
 	readonlyKeys, err := client.ListReadOnlyKeys(ctx, resourceGroup, name)
 	if err != nil {
-		log.Printf("[ERROR] Unable to List read-only keys for CosmosDB Account %s: %s", name, err)
-	} else {
-		d.Set("primary_readonly_master_key", readonlyKeys.PrimaryReadonlyMasterKey)
-		d.Set("secondary_readonly_master_key", readonlyKeys.SecondaryReadonlyMasterKey)
+		return fmt.Errorf("[ERROR] Unable to List read-only keys for CosmosDB Account %s: %s", name, err)
 	}
+	d.Set("primary_readonly_master_key", readonlyKeys.PrimaryReadonlyMasterKey)
+	d.Set("secondary_readonly_master_key", readonlyKeys.SecondaryReadonlyMasterKey)
+
+	connStringResp, err := client.ListConnectionStrings(ctx, resourceGroup, name)
+	if err != nil {
+		return fmt.Errorf("[ERROR] Unable to List connection strings for CosmosDB Account %s: %s", name, err)
+	}
+	var connStrings []string
+	if connStringResp.ConnectionStrings != nil {
+		connStrings = make([]string, len(*connStringResp.ConnectionStrings))
+		for i, v := range *connStringResp.ConnectionStrings {
+			connStrings[i] = *v.ConnectionString
+		}
+
+	}
+	d.Set("connection_strings", connStrings)
 
 	return nil
 }
@@ -772,28 +808,30 @@ func flattenAzureRmCosmosDBAccountGeoLocations(d *schema.ResourceData, account d
 //todo remove once deprecated field `failover_policy` is removed
 func resourceAzureRMCosmosDBAccountFailoverPolicyHash(v interface{}) int {
 	var buf bytes.Buffer
-	m := v.(map[string]interface{})
 
-	location := azureRMNormalizeLocation(m["location"].(string))
-	priority := int32(m["priority"].(int))
+	if m, ok := v.(map[string]interface{}); ok {
+		location := azureRMNormalizeLocation(m["location"].(string))
+		priority := int32(m["priority"].(int))
 
-	buf.WriteString(fmt.Sprintf("%s-%d", location, priority))
+		buf.WriteString(fmt.Sprintf("%s-%d", location, priority))
+	}
 
 	return hashcode.String(buf.String())
 }
 
 func resourceAzureRMCosmosDBAccountGeoLocationHash(v interface{}) int {
 	var buf bytes.Buffer
-	m := v.(map[string]interface{})
 
-	prefix := ""
-	if v, ok := m["prefix"].(string); ok {
-		prefix = v
+	if m, ok := v.(map[string]interface{}); ok {
+		prefix := ""
+		if v, ok := m["prefix"].(string); ok {
+			prefix = v
+		}
+		location := azureRMNormalizeLocation(m["location"].(string))
+		priority := int32(m["failover_priority"].(int))
+
+		buf.WriteString(fmt.Sprintf("%s-%s-%d", prefix, location, priority))
 	}
-	location := azureRMNormalizeLocation(m["location"].(string))
-	priority := int32(m["failover_priority"].(int))
-
-	buf.WriteString(fmt.Sprintf("%s-%s-%d", prefix, location, priority))
 
 	return hashcode.String(buf.String())
 }
